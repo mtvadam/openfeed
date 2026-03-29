@@ -72,21 +72,26 @@ def fetch_tiktok_details(url: str) -> dict | None:
         return None
 
 
-def analyze_url(url: str) -> dict:
-    """Call Gemini to classify the URL content. Returns dict with verdict, confidence, reasons."""
+def analyze_url(url: str, metadata: dict | None = None) -> dict:
+    """Call Gemini to classify the URL content. Returns dict with verdict, confidence, reasons.
+
+    If metadata is provided (author, description, video_url), it is used directly
+    instead of re-fetching via pyktok.
+    """
     client = genai.Client(api_key=GEMINI_API_KEY)
 
-    # Try to get rich metadata for TikTok URLs
+    # Use provided metadata, fall back to pyktok fetch, fall back to basic prompt
     prompt = PROMPT_TEMPLATE.format(url=url)
-    if "tiktok.com" in url:
+    details = metadata if metadata and metadata.get("author") else None
+    if not details and "tiktok.com" in url:
         details = fetch_tiktok_details(url)
-        if details:
-            prompt = RICH_PROMPT_TEMPLATE.format(
-                url=url,
-                author=details["author"],
-                description=details["description"],
-                video_url=details["video_url"],
-            )
+    if details:
+        prompt = RICH_PROMPT_TEMPLATE.format(
+            url=url,
+            author=details.get("author", "unknown"),
+            description=details.get("description", ""),
+            video_url=details.get("video_url", ""),
+        )
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",

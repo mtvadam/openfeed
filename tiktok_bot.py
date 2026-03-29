@@ -33,13 +33,15 @@ MESSAGES_URL = "https://www.tiktok.com/messages?lang=en"
 
 # Track messages we've already replied to
 _processed: set[str] = set()
+# Track the last chat name we checked to avoid re-clicking
+_last_checked_chat: str | None = None
 
 # XPath locators (based on TikTok's data-e2e attributes)
 LOCATORS = {
     "CHAT_LIST_ITEM": '//div[@data-e2e="chat-list-item"]',
     "CHAT_ITEM": '//div[@data-e2e="chat-item"]',
     "CHAT_UNIQUEID": '//p[@data-e2e="chat-uniqueid"]',
-    "DM_INPUT": '//div[@aria-label="Send a message..." and @role="textbox"]',
+    "DM_INPUT": '//div[@role="textbox"] | //div[contains(@aria-label,"Send a message")] | //div[contains(@class,"message-input")]',
     "DM_SEND": '//*[@role="button" and @data-e2e="message-send"]',
     "DM_WARN": "//div[@data-e2e='dm-warning']//*[@xmlns='http://www.w3.org/2000/svg']",
     "DM_WARN_TOO_FAST": "//div[text()='You are sending messages too fast. Take a rest.']",
@@ -76,6 +78,9 @@ def _create_driver() -> uc.Chrome:
 
     if TT_HEADLESS:
         options.add_argument("--headless=new")
+
+    # Enable performance logging to intercept network requests
+    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
     # Auto-detect installed Chrome version
     chrome_version = None
@@ -227,110 +232,159 @@ def _login(driver: uc.Chrome) -> bool:
 # ---------------------------------------------------------------------------
 
 def _send_in_chat(driver, msg: str) -> bool:
-    """Type and send a message in the currently open chat."""
+    """Type and send a message in the currently open chat using clipboard paste."""
     try:
+        import subprocess
+
         input_el = _wait(driver, LOCATORS["DM_INPUT"], 10)
+        input_el.click()
+        time.sleep(0.3)
 
-        # Clear any existing text
-        existing = input_el.text
-        if existing and existing not in ["Send a message...", "", None]:
-            input_el.send_keys(Keys.CONTROL + "a")
-            input_el.send_keys(Keys.DELETE)
+        # Copy message to clipboard (macOS)
+        process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+        process.communicate(msg.encode("utf-8"))
 
-        _paste_text(driver, LOCATORS["DM_INPUT"], msg)
+        # Paste from clipboard (Cmd+V on Mac)
+        action = ActionChains(driver)
+        action.key_down(Keys.COMMAND).send_keys("v").key_up(Keys.COMMAND)
+        action.perform()
         time.sleep(0.5)
 
-        # Verify text was entered, then send
-        if input_el.text:
-            _wait_and_click(driver, LOCATORS["DM_SEND"], 5)
-            time.sleep(1)
-            logger.info("Reply sent")
-            return True
-
-        logger.warning("Message text not entered correctly, retrying...")
-        return False
+        # Click send button
+        _wait_and_click(driver, LOCATORS["DM_SEND"], 5)
+        time.sleep(1)
+        logger.info("Reply sent")
+        return True
     except Exception as e:
         logger.error(f"Failed to send message: {e}")
         return False
 
 
-def _get_unreplied_video_urls(driver) -> list[str]:
-    """Find all shared TikTok video URLs in the chat that we haven't replied to yet.
-    A video is 'replied' if an 'OpenFeed Analysis' message follows it."""
-    video_urls = []
+def _get_video_items_from_network(driver) -> list[dict]:
+    """Extract video metadata from intercepted im/item_detail API responses."""
+    videos = []
+    try:
+        logs = driver.get_log("performance")
+        logger.info(f"Performance log entries: {len(logs)}")
+    except Exception as e:
+        logger.debug(f"Could not get performance logs: {e}")
+        return videos
+
+    im_detail_count = 0
+    for entry in logs:
+        try:
+            msg = json.loads(entry["message"])["message"]
+            if msg["method"] != "Network.responseReceived":
+                continue
+            resp_url = msg["params"]["response"]["url"]
+            if "/api/im/item_detail/" not in resp_url:
+                continue
+            im_detail_count += 1
+            logger.info(f"Found im/item_detail response #{im_detail_count}")
+
+            request_id = msg["params"]["requestId"]
+            try:
+                body = driver.execute_cdp_cmd(
+                    "Network.getResponseBody", {"requestId": request_id}
+                )
+                data = json.loads(body["body"])
+                item = data.get("itemInfo", {}).get("itemStruct", {})
+                if not item:
+                    continue
+
+                author = item.get("author", {}).get("uniqueId", "")
+                item_id = item.get("id", "")
+                if not author or not item_id:
+                    continue
+
+                desc = item.get("desc", "")
+                video_play_url = item.get("video", {}).get("playAddr", "")
+                sticker_texts = []
+                for s in item.get("stickersOnItem", []):
+                    sticker_texts.extend(s.get("stickerText", []))
+
+                videos.append({
+                    "url": f"https://www.tiktok.com/@{author}/video/{item_id}",
+                    "item_id": item_id,
+                    "author": author,
+                    "description": desc + (" | " + " | ".join(sticker_texts) if sticker_texts else ""),
+                    "video_url": video_play_url,
+                })
+                logger.info(f"Intercepted video: @{author}/video/{item_id}")
+            except Exception as e:
+                logger.debug(f"Could not get response body for request {request_id}: {e}")
+        except Exception:
+            continue
+
+    return videos
+
+
+def _get_unreplied_videos(driver) -> list[dict]:
+    """Find shared TikTok videos in the chat that we haven't replied to yet.
+    Uses network interception to get real video URLs from im/item_detail API."""
+    # Get videos from intercepted network requests
+    videos = _get_video_items_from_network(driver)
+    if not videos:
+        logger.info("No video items found in network logs")
+        return []
+
+    # Count how many "OpenFeed Analysis" replies are already in the chat
+    reply_count = 0
     try:
         items = driver.find_elements(By.XPATH, LOCATORS["CHAT_ITEM"])
-
-        # Walk through all chat items and track video URLs and our replies
-        pending_urls = []
         for item in items:
-            text = item.text.strip()
-
-            # Check if this is our reply (contains our signature)
-            if "OpenFeed Analysis" in text:
-                # We already replied to whatever came before — clear pending
-                pending_urls.clear()
+            try:
+                text = item.text.strip()
+                if "OpenFeed Analysis" in text:
+                    reply_count += 1
+            except StaleElementReferenceException:
                 continue
-
-            # Check if this item contains a shared TikTok video link
-            links = item.find_elements(By.TAG_NAME, "a")
-            for link in links:
-                href = link.get_attribute("href") or ""
-                if "tiktok.com" in href and "/video/" in href:
-                    pending_urls.append(href)
-                    break
-
-        # Whatever's left in pending_urls has no reply yet
-        video_urls = pending_urls
-        logger.info(f"Found {len(video_urls)} unreplied video(s) in chat")
     except Exception as e:
-        logger.debug(f"Error scanning chat: {e}")
-    return video_urls
+        logger.debug(f"Error counting replies: {e}")
+
+    # The unreplied videos are the ones after our existing replies
+    # Videos appear in chronological order; replies follow them
+    unreplied = videos[reply_count:]
+    logger.info(
+        f"Found {len(videos)} video(s), {reply_count} already replied, "
+        f"{len(unreplied)} unreplied"
+    )
+    return unreplied
 
 
 # ---------------------------------------------------------------------------
 # Message processing
 # ---------------------------------------------------------------------------
 
-def format_reply(result: dict, is_duplicate: bool) -> str:
-    reasons = (
-        json.loads(result["reasons_json"])
-        if isinstance(result["reasons_json"], str)
-        else result["reasons_json"]
-    )
-    lines = [
-        "OpenFeed Analysis",
-        "",
-        f"Verdict: {result['verdict']}",
-        f"Confidence: {result['confidence']}%",
-        "",
-        "Reasons:",
-    ]
-    for i, r in enumerate(reasons, 1):
-        lines.append(f"  {i}. {r}")
-
-    if is_duplicate:
-        lines.append(f"\nPreviously analyzed on {result['created_at']}")
-
-    return "\n".join(lines)
+def format_reply(result: dict) -> str:
+    reasons = result.get("reasons", [])
+    if isinstance(reasons, str):
+        reasons = json.loads(reasons)
+    reasons_str = " | ".join(reasons[:3])
+    return f"OpenFeed: {result['verdict']} ({result['confidence']}%) - {reasons_str}"
 
 
-def _process_message(driver, url: str) -> None:
+def _analyze_video(video: dict) -> str | None:
+    """Analyze a video and return the reply text. Returns None if already analyzed."""
+    url = video["url"]
     logger.info(f"Processing URL: {url}")
     normalized = utils.normalize_url(url)
     fingerprint = utils.compute_fingerprint(normalized)
 
     existing = db.find_by_fingerprint(fingerprint)
     if existing:
-        logger.info(f"Duplicate found for fingerprint {fingerprint[:12]}...")
-        reply = format_reply(existing, is_duplicate=True)
-        _send_in_chat(driver, reply)
-        return
+        logger.info(f"Already analyzed {fingerprint[:12]}, skipping")
+        return None
 
-    logger.info("Analyzing URL with Gemini...")
-    result = analyzer.analyze_url(url)
+    logger.info("Analyzing with Gemini...")
+    metadata = {
+        "author": video.get("author", ""),
+        "description": video.get("description", ""),
+        "video_url": video.get("video_url", ""),
+    }
+    result = analyzer.analyze_url(url, metadata=metadata)
 
-    record = db.insert_analysis(
+    db.insert_analysis(
         source_url=url,
         fingerprint=fingerprint,
         verdict=result["verdict"],
@@ -338,9 +392,9 @@ def _process_message(driver, url: str) -> None:
         reasons=result["reasons"],
     )
 
-    reply = format_reply(record, is_duplicate=False)
-    _send_in_chat(driver, reply)
-    logger.info(f"Replied with verdict: {result['verdict']}")
+    reply = format_reply(result, is_duplicate=False)
+    logger.info(f"Verdict: {result['verdict']}")
+    return reply
 
 
 # ---------------------------------------------------------------------------
@@ -370,86 +424,90 @@ def _process_chat_list(driver, items, label="chat") -> None:
     """Process a list of chat item elements."""
     for i, item in enumerate(items):
         try:
-            logger.info(f"Clicking {label} item {i}...")
+            # Drain stale performance logs
+            try:
+                driver.get_log("performance")
+            except Exception:
+                pass
+
+            # Click the conversation
+            logger.info(f"Opening {label} {i}...")
             item.click()
             time.sleep(3)
+
+            # Verify we're still on messages page (not redirected)
+            if "/messages" not in driver.current_url:
+                logger.warning(f"Navigated away from messages, aborting")
+                return
 
             # Accept message request if needed
             if label == "request":
                 if not _try_accept_request(driver):
-                    logger.debug(f"No accept prompt for {label} {i}, skipping")
                     continue
+                time.sleep(2)
 
-            # Wait for chat to load
-            if not _is_element_present(driver, LOCATORS["DM_INPUT"], 8):
-                logger.info(f"Chat input not found for {label} {i}")
-                continue
+            # Wait for DM input to confirm chat loaded
+            _is_element_present(driver, LOCATORS["DM_INPUT"], 5)
 
-            # Find unreplied video URLs
-            unreplied = _get_unreplied_video_urls(driver)
+            # Get videos from network interception (already filters out replied ones)
+            unreplied = _get_unreplied_videos(driver)
             if not unreplied:
-                logger.info(f"No unreplied videos in {label} {i}")
-                continue
+                logger.info(f"No new videos in {label} {i}")
+                return
 
-            # Process each unreplied video
-            for url in unreplied:
-                url_key = url[:200]
-                if url_key in _processed:
+            # Analyze all unreplied videos, collect replies, send as ONE message
+            replies = []
+            for video in unreplied:
+                if video["item_id"] in _processed:
                     continue
-                _processed.add(url_key)
-                _process_message(driver, url)
+                _processed.add(video["item_id"])
+                reply = _analyze_video(video)
+                if reply:
+                    replies.append(reply)
+
+            if replies:
+                combined = "\n\n".join(replies)
+                _send_in_chat(driver, combined)
+                logger.info(f"Sent {len(replies)} analysis result(s) in 1 message")
 
         except StaleElementReferenceException:
-            logger.debug("Stale element, refreshing next cycle")
-            break
+            return
         except Exception as e:
-            logger.error(f"Error processing {label} {i}: {e}", exc_info=True)
+            logger.error(f"Error in {label} {i}: {e}", exc_info=True)
+            return
+
+
+def _ensure_on_messages(driver, force_refresh=False) -> bool:
+    """Make sure we're on the messages page. Navigate there if not."""
+    on_messages = "/messages" in driver.current_url and "/login" not in driver.current_url
+    if force_refresh or not on_messages:
+        driver.get(MESSAGES_URL)
+        time.sleep(3)
+    if "/login" in driver.current_url:
+        logger.warning("Session expired")
+        return False
+    return True
 
 
 def poll_inbox(driver) -> None:
     """Check for new unread DMs, including message requests."""
-    driver.get(MESSAGES_URL)
-    time.sleep(3)
-
-    if "/login" in driver.current_url:
-        logger.warning("Session expired — re-logging in")
+    if not _ensure_on_messages(driver):
         _login(driver)
         return
 
-    # --- Check message requests first ---
-    if _is_element_present(driver, LOCATORS["MSG_REQUESTS"], 3):
-        logger.info("Found message requests — clicking into it...")
-        try:
-            el = _wait(driver, LOCATORS["MSG_REQUESTS"], 3)
-            # Use JS click — the element is often not interactable via normal click
-            driver.execute_script("arguments[0].click();", el)
-            time.sleep(3)
-        except Exception as e:
-            logger.debug(f"Could not click message requests: {e}")
-            driver.get(MESSAGES_URL)
-            time.sleep(3)
+    # --- Check message requests (only if new ones since last check) ---
+    # Skip requests entirely for now — focus on main chat list
+    # Message requests don't contain shared videos typically
 
-        # Look for request items (try multiple selectors)
-        request_items = driver.find_elements(By.XPATH, LOCATORS["MSG_REQUEST_ITEM"])
-        if not request_items:
-            # Fallback: any clickable chat-like items in the request list
-            request_items = driver.find_elements(By.XPATH, LOCATORS["CHAT_LIST_ITEM"])
+    # --- Always fresh-load messages page to bust API cache ---
+    if not _ensure_on_messages(driver, force_refresh=True):
+        return
 
-        if request_items:
-            logger.info(f"Found {len(request_items)} message requests")
-            _process_chat_list(driver, request_items, label="request")
+    chat_items = driver.find_elements(By.XPATH, LOCATORS["CHAT_LIST_ITEM"])
+    if not chat_items:
+        return
 
-        # Navigate back to main messages
-        driver.get(MESSAGES_URL)
-        time.sleep(3)
-
-    # --- Regular chat list ---
-    if _is_element_present(driver, LOCATORS["CHAT_LIST_ITEM"], 5):
-        chat_items = driver.find_elements(By.XPATH, LOCATORS["CHAT_LIST_ITEM"])
-        logger.info(f"Found {len(chat_items)} conversations")
-        _process_chat_list(driver, chat_items, label="chat")
-    else:
-        logger.info("No conversations in chat list")
+    _process_chat_list(driver, chat_items[:1], label="chat")
 
     if len(_processed) > 5000:
         _processed.clear()
