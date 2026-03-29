@@ -1,0 +1,5 @@
+.env
+__pycache__/
+profiles/
+=4.20.0
+.claude/
